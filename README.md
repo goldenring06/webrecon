@@ -22,3 +22,12 @@ go build -o recon recon.go
 
 # Run
 ./recon
+
+
+Become a Contributor!
+We're building the future of recon tools together!
+Help us by:
+
+Improving scan algorithms
+
+Creating detection templates
