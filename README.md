@@ -11,7 +11,7 @@ A next-generation reconnaissance tool with automated payload selection and intel
 
 ## 📦 Installation
 
-git clone [https://github.com/goldenring06/webrecon.git]
+git clone https://github.com/goldenring06/webrecon.git
 
 # Set API tokens (required)
 export GITHUB_TOKEN="ghp_yourtokenhere"
