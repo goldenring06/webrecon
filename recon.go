@@ -579,82 +579,154 @@ func queryViewDNSInfo(domain string) ([]string, error) {
 
 // New functions for DNS history and Archive.org checks
 func runSecurityTrails(domain string, wg *sync.WaitGroup, results chan string, errors chan error) {
-    defer wg.Done()
-    
-    token := os.Getenv("SECURITYTRAILS_TOKEN")
-    if token == "" {
-        errors <- fmt.Errorf("securitytrails skipped: no API token provided (set SECURITYTRAILS_TOKEN environment variable)")
-        return
-    }
+	defer wg.Done()
 
-    url := fmt.Sprintf("https://api.securitytrails.com/v1/history/%s/dns/a", domain)
+	token := os.Getenv("SECURITYTRAILS_TOKEN")
+	if token == "" {
+		errors <- fmt.Errorf("securitytrails: no API token (set SECURITYTRAILS_TOKEN)")
+		return
+	}
 
-    var resp *http.Response
-    var err error
+	// Define all endpoints we want to query
+	endpoints := []struct {
+		url       string
+		processor func(*http.Response) ([]string, error)
+	}{
+		// 1. Original historical DNS endpoint
+		{
+			fmt.Sprintf("https://api.securitytrails.com/v1/history/%s/dns/a", domain),
+			func(resp *http.Response) ([]string, error) {
+				var data struct {
+					Records []struct{ Hostname string `json:"host"` }
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+					return nil, err
+				}
+				var subs []string
+				for _, r := range data.Records {
+					if r.Hostname != "" {
+						subs = append(subs, r.Hostname)
+					}
+				}
+				return subs, nil
+			},
+		},
+		// 2. Historical IPs endpoint (1st new curl command)
+		{
+			fmt.Sprintf("https://api.securitytrails.com/v1/history/%s/dns/a?page=1", domain),
+			func(resp *http.Response) ([]string, error) {
+				var data struct {
+					Records []struct {
+						Values []struct{ IP string `json:"ip"` }
+					}
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+					return nil, err
+				}
+				uniqueIPs := make(map[string]struct{})
+				for _, r := range data.Records {
+					for _, v := range r.Values {
+						if v.IP != "" {
+							uniqueIPs[v.IP] = struct{}{}
+						}
+					}
+				}
+				ips := make([]string, 0, len(uniqueIPs))
+				for ip := range uniqueIPs {
+					ips = append(ips, ip)
+				}
+				return ips, nil
+			},
+		},
+		// 3. Subdomains endpoint (2nd new curl command)
+		{
+			fmt.Sprintf("https://api.securitytrails.com/v1/domain/%s/subdomains", domain),
+			func(resp *http.Response) ([]string, error) {
+				var data struct{ Subdomains []string }
+				if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+					return nil, err
+				}
+				subs := make([]string, 0, len(data.Subdomains))
+				for _, s := range data.Subdomains {
+					if s != "" {
+						subs = append(subs, fmt.Sprintf("%s.%s", s, domain))
+					}
+				}
+				return subs, nil
+			},
+		},
+	}
 
-    // Retry logic
-    for attempt := 1; attempt <= 3; attempt++ {
-        req, _ := http.NewRequest("GET", url, nil)
-        req.Header.Set("APIKEY", token)
-        req.Header.Set("Accept", "application/json")
-        
-        resp, err = httpClient.Do(req)
-        if err == nil {
-            break
-        }
-        
-        if attempt < MaxRetries {
-            time.Sleep(time.Duration(attempt) * RetryDelay)
-        }
-    }
-    
-    if err != nil {
-        errors <- fmt.Errorf("securitytrails request failed after %d attempts: %v", MaxRetries, err)
-        return
-    }
-    defer resp.Body.Close()
+	// Process all endpoints concurrently
+	var (
+		collectorWg sync.WaitGroup
+		allResults   = make(chan []string)
+	)
+	for _, ep := range endpoints {
+		collectorWg.Add(1)
+		go func(ep struct {
+			url       string
+			processor func(*http.Response) ([]string, error)
+		}) {
+			defer collectorWg.Done()
 
-    // Enhanced status code handling
-    switch resp.StatusCode {
-    case http.StatusOK:
-        // Proceed normally
-    case http.StatusUnauthorized:
-        errors <- fmt.Errorf("securitytrails authentication failed (invalid API key)")
-        return
-    case http.StatusTooManyRequests:
-        errors <- fmt.Errorf("securitytrails rate limit exceeded")
-        return
-    case http.StatusForbidden:
-        errors <- fmt.Errorf("securitytrails access forbidden (insufficient permissions)")
-        return
-    default:
-        errors <- fmt.Errorf("securitytrails returned unexpected status: %d %s", 
-            resp.StatusCode, http.StatusText(resp.StatusCode))
-        return
-    }
+			resp, err := makeRequest(ep.url, token)
+			if err != nil {
+				errors <- fmt.Errorf("securitytrails request failed (%s): %v", ep.url, err)
+				return
+			}
+			defer resp.Body.Close()
 
-    var data struct {
-        Records []struct {
-            Values []struct {
-                IP string `json:"ip"`
-            } `json:"values"`
-            Hostname string `json:"host"`
-        } `json:"records"`
-    }
+			subs, err := ep.processor(resp)
+			if err != nil {
+				errors <- fmt.Errorf("securitytrails parse failed (%s): %v", ep.url, err)
+				return
+			}
+			allResults <- subs
+		}(ep)
+	}
 
-    if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-        errors <- fmt.Errorf("securitytrails JSON parse failed: %v", err)
-        return
-    }
+	// Close channel when all workers finish
+	go func() {
+		collectorWg.Wait()
+		close(allResults)
+	}()
 
-    count := 0
-    for _, record := range data.Records {
-        if record.Hostname != "" {
-            results <- record.Hostname
-            count++
-        }
-    }
-    fmt.Printf(Green+"  [✔] SecurityTrails found %d historical subdomains\n"+Reset, count)
+	// Deduplicate and send results
+	unique := make(map[string]struct{})
+	count := 0
+	for subs := range allResults {
+		for _, s := range subs {
+			if _, exists := unique[s]; !exists {
+				unique[s] = struct{}{}
+				results <- s
+				count++
+			}
+		}
+	}
+
+	fmt.Printf(Green+"  [✔] SecurityTrails found %d unique items\n"+Reset, count)
+}
+
+// Helper function for HTTP requests with retries
+func makeRequest(url, token string) (*http.Response, error) {
+	for attempt := 1; attempt <= 3; attempt++ {
+		req, _ := http.NewRequest("GET", url, nil)
+		req.Header.Set("APIKEY", token)
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := httpClient.Do(req)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			return resp, nil
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+		if attempt < 3 {
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+	}
+	return nil, fmt.Errorf("max retries exceeded")
 }
 
 
@@ -701,7 +773,7 @@ func printSummary(config *Config) {
 	fmt.Println(Blue + "==================================" + Reset)
 }
 
-func runSubfinder(domain string, wg *sync.WaitGroup, results chan string, errors chan error) {
+/*func runSubfinder(domain string, wg *sync.WaitGroup, results chan string, errors chan error) {
     defer wg.Done()
     //fmt.Println(Cyan + "  [>] Running Subfinder..." + Reset)
     
@@ -757,9 +829,69 @@ func runSubfinder(domain string, wg *sync.WaitGroup, results chan string, errors
     }
     
     fmt.Printf(Green+"  [✔] Subfinder found %d subdomains\n"+Reset, count)
+}*/
+
+func runSubfinder(domain string, wg *sync.WaitGroup, results chan string, errors chan error) {
+    defer wg.Done()
+    
+    cmd := exec.Command("subfinder", "-d", domain, "-all", "-recursive")
+    
+    stdoutPipe, _ := cmd.StdoutPipe()
+    stderrPipe, _ := cmd.StderrPipe()
+    
+    if err := cmd.Start(); err != nil {
+        errors <- fmt.Errorf("subfinder failed to start: %v", err)
+        return
+    }
+    
+    outputLines := make(chan string, 1000) // Buffered channel for performance
+    var scannerWg sync.WaitGroup
+    
+    // Read stdout in a goroutine
+    scannerWg.Add(1)
+    go func() {
+        defer scannerWg.Done()
+        scanner := bufio.NewScanner(stdoutPipe)
+        for scanner.Scan() {
+            line := strings.TrimSpace(scanner.Text())
+            if line != "" {
+                fmt.Println("    " + line)
+                outputLines <- line
+            }
+        }
+    }()
+    
+    // Read stderr in a goroutine (no channel writes, so no sync needed)
+    go func() {
+        scanner := bufio.NewScanner(stderrPipe)
+        for scanner.Scan() {
+            fmt.Println(Red + "            " + scanner.Text() + Reset)
+        }
+    }()
+    
+    // Wait for command to complete
+    err := cmd.Wait()
+    
+    // Wait for the scanner goroutine to finish sending all lines
+    scannerWg.Wait()
+    close(outputLines) // Safe to close now
+    
+    if err != nil {
+        errors <- fmt.Errorf("subfinder execution failed: %v", err)
+        return
+    }
+    
+    // Count and send results
+    count := 0
+    for line := range outputLines {
+        results <- line
+        count++
+    }
+    
+    fmt.Printf(Green+"  [✔] Subfinder found %d subdomains\n"+Reset, count)
 }
 
-func runAssetfinder(domain string, wg *sync.WaitGroup, results chan string, errors chan error) {
+/*func runAssetfinder(domain string, wg *sync.WaitGroup, results chan string, errors chan error) {
     defer wg.Done()
     //fmt.Println(Cyan + "  [>] Running Assetfinder..." + Reset)
     
@@ -808,12 +940,141 @@ func runAssetfinder(domain string, wg *sync.WaitGroup, results chan string, erro
     }
     
     fmt.Printf(Green+"  [✔] Assetfinder found %d subdomains\n"+Reset, count)
+}*/
+
+func runAssetfinder(domain string, wg *sync.WaitGroup, results chan string, errors chan error) {
+    defer wg.Done()
+    
+    // 1. Setup command with context for timeout control
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+    defer cancel()
+    
+    cmd := exec.CommandContext(ctx, "assetfinder", "--subs-only", domain)
+    
+    // 2. Create pipes with error handling
+    stdoutPipe, err := cmd.StdoutPipe()
+    if err != nil {
+        errors <- fmt.Errorf("stdout pipe failed: %v", err)
+        return
+    }
+    
+    stderrPipe, err := cmd.StderrPipe()
+    if err != nil {
+        errors <- fmt.Errorf("stderr pipe failed: %v", err)
+        return
+    }
+
+    // 3. Start process
+    if err := cmd.Start(); err != nil {
+        errors <- fmt.Errorf("process start failed: %v", err)
+        return
+    }
+
+    // 4. Buffered channel with safe closing mechanism
+    outputLines := make(chan string, 5000) // Large buffer for big scans
+    var (
+        outputClosed bool
+        outputMutex  sync.Mutex
+        scannerWg    sync.WaitGroup
+    )
+
+    // 5. Safe send function
+    safeSend := func(line string) bool {
+        outputMutex.Lock()
+        defer outputMutex.Unlock()
+        if !outputClosed {
+            select {
+            case outputLines <- line:
+                return true
+            case <-ctx.Done():
+                return false
+            }
+        }
+        return false
+    }
+
+    // 6. Stdout scanner goroutine
+    scannerWg.Add(1)
+    go func() {
+        defer scannerWg.Done()
+        scanner := bufio.NewScanner(stdoutPipe)
+        
+        for scanner.Scan() {
+            line := strings.TrimSpace(scanner.Text())
+            if line != "" {
+                fmt.Println("    " + line)
+                if !safeSend(line) {
+                    return // Context canceled or channel closed
+                }
+            }
+            
+            // Check for context cancellation
+            select {
+            case <-ctx.Done():
+                return
+            default:
+            }
+        }
+    }()
+
+    // 7. Stderr handler goroutine
+    go func() {
+        scanner := bufio.NewScanner(stderrPipe)
+        for scanner.Scan() {
+            fmt.Println(Red + "            " + scanner.Text() + Reset)
+        }
+    }()
+
+    // 8. Wait for completion with timeout
+    processDone := make(chan struct{})
+    go func() {
+        scannerWg.Wait()
+        close(processDone)
+    }()
+
+    select {
+    case <-processDone:
+        // Normal completion
+    case <-ctx.Done():
+        errors <- fmt.Errorf("scan timed out after 10 minutes")
+        cmd.Process.Kill()
+        return
+    }
+
+    // 9. Safe channel closing
+    outputMutex.Lock()
+    if !outputClosed {
+        close(outputLines)
+        outputClosed = true
+    }
+    outputMutex.Unlock()
+
+    // 10. Process results with cancellation support
+    count := 0
+    for line := range outputLines {
+        select {
+        case results <- line:
+            count++
+        case <-ctx.Done():
+            fmt.Println(Yellow + "  [!] Results processing canceled" + Reset)
+            return
+        }
+    }
+
+    // 11. Verify process exit status
+    if err := cmd.Wait(); err != nil {
+        if ctx.Err() == nil { // Only report if not canceled
+            errors <- fmt.Errorf("process execution failed: %v", err)
+        }
+        return
+    }
+
+    fmt.Printf(Green+"  [✔] Assetfinder found %d subdomains\n"+Reset, count)
 }
 
 
 
-
-func runGithubSubdomains(domain string, wg *sync.WaitGroup, results chan string, errors chan error) {
+/*func runGithubSubdomains(domain string, wg *sync.WaitGroup, results chan string, errors chan error) {
     defer wg.Done()
     //fmt.Println(Cyan + "  [>] Running Github Subdomains..." + Reset)
     
@@ -870,15 +1131,102 @@ func runGithubSubdomains(domain string, wg *sync.WaitGroup, results chan string,
     }
     
     fmt.Printf(Green+"  [✔] Github Subdomains found %d subdomains\n"+Reset, count)
+}*/
+
+func runGithubSubdomains(domain string, wg *sync.WaitGroup, results chan string, errors chan error) {
+    defer wg.Done()
+    
+    token := os.Getenv("GITHUB_TOKEN")
+    if token == "" {
+        errors <- fmt.Errorf("missing GITHUB_TOKEN")
+        return
+    }
+
+    cmd := exec.Command("github-subdomains", "-d", domain, "-t", token)
+    stdoutPipe, _ := cmd.StdoutPipe()
+    stderrPipe, _ := cmd.StderrPipe()
+
+    if err := cmd.Start(); err != nil {
+        errors <- fmt.Errorf("failed to start: %v", err)
+        return
+    }
+
+    // Channel with timeout
+    outputLines := make(chan string, 1000)
+    var scannerWg sync.WaitGroup
+    scannerWg.Add(1)
+
+    // Stdout scanner with timeout
+    go func() {
+        defer scannerWg.Done()
+        defer close(outputLines)
+        
+        scanner := bufio.NewScanner(stdoutPipe)
+        lastActive := time.Now()
+
+        for scanner.Scan() {
+            line := strings.TrimSpace(scanner.Text())
+            if line == "" {
+                continue
+            }
+
+            // Detect empty results
+            if strings.Contains(line, "\"total_count\": 0") {
+                fmt.Println("    [i] No more results")
+                return
+            }
+
+            fmt.Println("    " + line)
+            outputLines <- line
+            lastActive = time.Now()
+            
+            // Timeout check
+            if time.Since(lastActive) > 20*time.Second {
+                fmt.Println(Yellow+"  [!] Timeout waiting for data"+Reset)
+                return
+            }
+        }
+    }()
+
+    // Stderr handler (unchanged)
+    go func() {
+        scanner := bufio.NewScanner(stderrPipe)
+        for scanner.Scan() {
+            fmt.Println(Red + "            " + scanner.Text() + Reset)
+        }
+    }()
+
+    // Process timeout
+    done := make(chan error)
+    go func() { done <- cmd.Wait() }()
+
+    select {
+    case err := <-done:
+        if err != nil {
+            errors <- fmt.Errorf("execution failed: %v", err)
+        }
+    case <-time.After(5 * time.Minute):
+        cmd.Process.Kill()
+        errors <- fmt.Errorf("timeout after 5 minutes")
+    }
+
+    scannerWg.Wait()
+    
+    // Process results (unchanged)
+    count := 0
+    for line := range outputLines {
+        results <- line
+        count++
+    }
+    fmt.Printf(Green+"  [✔] Found %d subdomains\n"+Reset, count)
 }
 
 func runCrtSh(domain string, wg *sync.WaitGroup, results chan string, errors chan error) {
     defer wg.Done()
-    //fmt.Println(Cyan + "  [>] Running crt.sh..." + Reset)
     
     url := fmt.Sprintf("https://crt.sh/?q=%%25.%s&output=json", domain)
     
-    // Create the request first
+    // Create the request
     req, err := http.NewRequest("GET", url, nil)
     if err != nil {
         errors <- fmt.Errorf("crt.sh request creation failed: %v", err)
@@ -916,17 +1264,30 @@ func runCrtSh(domain string, wg *sync.WaitGroup, results chan string, errors cha
         return
     }
 
+    // Create a map to store unique subdomains
+    uniqueSubs := make(map[string]struct{})
     count := 0
+
     for _, cert := range certs {
         for _, sub := range strings.Split(cert.NameValue, "\n") {
-            sub = strings.TrimSpace(strings.TrimPrefix(sub, "*."))
-            if sub != "" && strings.HasSuffix(sub, domain) {
-                fmt.Println("    " + sub)
-                results <- sub
-                count++
+            // Trim whitespace, remove quotes, and remove wildcard prefix
+            sub = strings.TrimSpace(sub)
+            sub = strings.TrimPrefix(sub, "*.")
+            sub = strings.Trim(sub, "\"")
+            
+            // Validate the subdomain matches the pattern
+            matched, _ := regexp.MatchString(`^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`, sub)
+            if matched && strings.HasSuffix(sub, domain) {
+                if _, exists := uniqueSubs[sub]; !exists {
+                    uniqueSubs[sub] = struct{}{}
+                    fmt.Println("    " + sub)
+                    results <- sub
+                    count++
+                }
             }
         }
     }
+    
     fmt.Printf(Green+"  [✔] crt.sh found %d subdomains\n"+Reset, count)
 }
 
@@ -1007,7 +1368,7 @@ func checkAliveSubdomains(config *Config, inputFile, outputFile string) error {
         "-title",    // Page title
         "-server",   // Server header
         "-o", outputFile,
-        //"-silent",
+        //"-silent",   // Optional: reduces noise in output
     )
     
     stdoutPipe, _ := cmd.StdoutPipe()
