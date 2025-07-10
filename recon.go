@@ -1357,59 +1357,41 @@ func resolveSubdomains(inputFile, outputFile string) error {
     return cmd.Wait()
 }
 
-func checkAliveSubdomains(config *Config, inputFile, outputFile string) error {
-    fmt.Println(Yellow + "\n[+] Checking alive subdomains with HTTPX..." + Reset)
 
+
+func checkAliveSubdomains(config *Config, inputFile, outputFile string) error {
+    fmt.Println(Yellow + "\n[+] Checking alive subdomains..." + Reset)
+    
     cmd := exec.Command(
         "httpx-toolkit",
         "-l", inputFile,
         "-ports", config.Ports,
-        "-sc",       // Status code
-        "-title",    // Page title
-        "-server",   // Server header
+        "-threads", fmt.Sprintf("%d", config.Threads),
+        //"-sc",
+        //"-title",
+        //"-server",
+        //"-no-color",
+        "-silent",
         "-o", outputFile,
-        //"-silent",   // Optional: reduces noise in output
     )
-    
-    stdoutPipe, _ := cmd.StdoutPipe()
-    stderrPipe, _ := cmd.StderrPipe()
-    
-    if err := cmd.Start(); err != nil {
-        return fmt.Errorf("httpx failed to start: %w", err)
-    }
-    
-    go func() {
-        scanner := bufio.NewScanner(stdoutPipe)
-        for scanner.Scan() {
-            fmt.Println("    " + scanner.Text())
-        }
-    }()
-    
-    go func() {
-        scanner := bufio.NewScanner(stderrPipe)
-        for scanner.Scan() {
-            fmt.Println(Red + "           " + scanner.Text() + Reset)
-        }
-    }()
-    
-    if err := cmd.Wait(); err != nil {
-        return fmt.Errorf("httpx execution failed: %w", err)
+
+    if err := cmd.Run(); err != nil {
+        return fmt.Errorf("httpx failed: %w", err)
     }
 
-    alive, err := countLines(outputFile)
+    alive, err := readLines(outputFile)
     if err != nil {
         return err
     }
 
-    if alive == 0 {
+    if len(alive) == 0 {
         return fmt.Errorf("no alive subdomains found")
     }
 
-    fmt.Printf(Green+"[✔] Found %d alive subdomains\n"+Reset, alive)
+    fmt.Printf(Green+"[✔] Found %d alive subdomains\n"+Reset, len(alive))
     fmt.Printf(Green+"[✔] Saved to: %s\n"+Reset, outputFile)
     return nil
 }
-
 func countLines(filename string) (int, error) {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -1555,6 +1537,8 @@ func findSensitiveData(config *Config, katanaFile, gauFile, waybackFile string) 
 
 func runSecurityChecks(config *Config, aliveFile string) error {
 	fmt.Println(Yellow + "\n[+] Running security checks..." + Reset)
+
+   // cleanFile := filepath.Join(config.OutputDir, "subdomains_alive_clean.txt")
 
 	var wg sync.WaitGroup
 	wg.Add(4)
@@ -1821,7 +1805,7 @@ func fetchWaybackSensitive(domain, outputFile string) ([]string, error) {
 	return matches, scanner.Err()
 }
 
-func checkOpenRedirects(config *Config, allURLsFile string) error {
+/*func checkOpenRedirects(config *Config, allURLsFile string) error {
 	fmt.Println(Yellow + "\n[+] Finding redirect parameters..." + Reset)
 
 	redirectDir := filepath.Join(config.OutputDir, "redirect_checks")
@@ -1899,6 +1883,143 @@ func checkOpenRedirects(config *Config, allURLsFile string) error {
 	}
 
 	return nil
+}*/
+
+func checkOpenRedirects(config *Config, allURLsFile string) error {
+    fmt.Println(Yellow + "\n[+] Finding redirect parameters..." + Reset)
+
+    // 1. Verify input file exists and has content
+    if _, err := os.Stat(allURLsFile); os.IsNotExist(err) {
+        return fmt.Errorf("input file does not exist: %s", allURLsFile)
+    }
+
+    // 2. Create output directory
+    redirectDir := filepath.Join(config.OutputDir, "redirect_checks")
+    if err := os.MkdirAll(redirectDir, 0755); err != nil {
+        return fmt.Errorf("failed to create redirect directory: %w", err)
+    }
+
+    redirectParamsFile := filepath.Join(redirectDir, "redirect_params.txt")
+
+    // 3. Execute the gf/uro pipeline (same as manual command)
+    if err := runGFUROPipeline(allURLsFile, redirectParamsFile); err != nil {
+        fmt.Println(Yellow + "  [!] gf/uro pipeline failed, falling back to regex method..." + Reset)
+        return findRedirectsWithRegex(allURLsFile, redirectParamsFile)
+    }
+
+    // 4. Read and process results
+    matches, err := readLines(redirectParamsFile)
+    if err != nil {
+        return fmt.Errorf("failed to read results: %w", err)
+    }
+
+    // 5. Output results
+    if len(matches) == 0 {
+        fmt.Println(Yellow + "  [i] No redirect parameters found" + Reset)
+        return nil
+    }
+
+    fmt.Printf(Green+"  [✔] Found %d redirect parameters\n"+Reset, len(matches))
+    fmt.Printf(Green+"  [✔] Saved to: %s\n"+Reset, redirectParamsFile)
+
+    printSampleResults(matches, 5)
+    return nil
+}
+
+func runGFUROPipeline(inputFile, outputFile string) error {
+    gfCmd := exec.Command("gf", "redirect")
+    uroCmd := exec.Command("uro")
+    sortCmd := exec.Command("sort", "-u")
+    
+    // Set up pipeline: gf -> uro -> sort -> tee
+    input, err := os.Open(inputFile)
+    if err != nil {
+        return fmt.Errorf("failed to open input file: %w", err)
+    }
+    defer input.Close()
+
+    output, err := os.Create(outputFile)
+    if err != nil {
+        return fmt.Errorf("failed to create output file: %w", err)
+    }
+    defer output.Close()
+
+    // Chain the commands together
+    gfCmd.Stdin = input
+    uroCmd.Stdin, _ = gfCmd.StdoutPipe()
+    sortCmd.Stdin, _ = uroCmd.StdoutPipe()
+    sortCmd.Stdout = output
+
+    // Start all commands
+    if err := gfCmd.Start(); err != nil {
+        return fmt.Errorf("gf failed to start: %w", err)
+    }
+    if err := uroCmd.Start(); err != nil {
+        return fmt.Errorf("uro failed to start: %w", err)
+    }
+    if err := sortCmd.Start(); err != nil {
+        return fmt.Errorf("sort failed to start: %w", err)
+    }
+
+    // Wait for commands to complete
+    if err := gfCmd.Wait(); err != nil {
+        return fmt.Errorf("gf failed: %w", err)
+    }
+    if err := uroCmd.Wait(); err != nil {
+        return fmt.Errorf("uro failed: %w", err)
+    }
+    if err := sortCmd.Wait(); err != nil {
+        return fmt.Errorf("sort failed: %w", err)
+    }
+
+    return nil
+}
+
+func findRedirectsWithRegex(inputFile, outputFile string) error {
+    urls, err := readLines(inputFile)
+    if err != nil {
+        return fmt.Errorf("failed to read input file: %w", err)
+    }
+
+    var matches []string
+    paramPattern := regexp.MustCompile(`(?i)(\?|&)(redirect|redir|url|return|next|continue|dest|rurl|uri|callback|location|goto|exit|target|image_url|file|download|path|include|load|doc|document|view|retrieve|data)\b`)
+
+    for _, url := range urls {
+        if paramPattern.MatchString(url) {
+            matches = append(matches, url)
+        }
+    }
+
+    matches = removeDuplicateMatches(matches)
+    return writeToFile(outputFile, matches)
+}
+
+func removeDuplicateMatches(matches []string) []string {
+    seen := make(map[string]bool)
+    var result []string
+    for _, match := range matches {
+        if !seen[match] {
+            seen[match] = true
+            result = append(result, match)
+        }
+    }
+    return result
+}
+
+func printSampleResults(results []string, max int) {
+    if len(results) == 0 {
+        return
+    }
+    if len(results) < max {
+        max = len(results)
+    }
+    fmt.Println(Cyan + "  [i] Sample redirect parameters:" + Reset)
+    for i := 0; i < max; i++ {
+        fmt.Printf("  - %s\n", results[i])
+    }
+    if len(results) > max {
+        fmt.Printf(Cyan+"  [i] ... and %d more\n"+Reset, len(results)-max)
+    }
 }
 
 
